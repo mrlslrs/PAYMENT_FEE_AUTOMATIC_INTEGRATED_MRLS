@@ -1,0 +1,2211 @@
+!pip install -q pyspark==3.5.1 gspread gspread_dataframe google-cloud-bigquery holidays
+
+
+
+import base64
+import getpass
+import glob
+import io
+import os
+import re
+import shutil
+import socket
+import time
+import unicodedata
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from itertools import chain
+from zoneinfo import ZoneInfo
+
+import gspread
+import numpy as np
+import pandas as pd
+import pytz
+import requests
+
+from google.auth import default
+from google.cloud import bigquery
+from google.colab import auth
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from gspread.utils import a1_to_rowcol
+from gspread_dataframe import set_with_dataframe, get_as_dataframe
+
+from IPython.display import Javascript, display
+
+from pyspark.sql import SparkSession, functions as F, Window
+from pyspark.sql.types import StringType, DoubleType
+
+
+
+auth.authenticate_user()
+creds, _ = default()
+bq_client = bigquery.Client(project='projeto-brazil-prd', credentials=creds)
+
+spark = (
+    SparkSession.builder
+    .appName('automacao_pagamentos')
+    .config('spark.jars.packages', 'com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.36.1')
+    .getOrCreate()
+)
+
+
+
+dias_semana = {
+    0: "Segunda-Feira",
+    1: "Terça-Feira",
+    2: "Quarta-Feira",
+    3: "Quinta-Feira",
+    4: "Sexta-Feira",
+    5: "Sábado",
+    6: "Domingo"
+}
+
+TZ_BR = ZoneInfo("America/Sao_Paulo")
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+usar_data_automatica = True
+
+
+# ============================================================
+# PERÍODO MANUAL - Se "False"
+# ============================================================
+
+# Usadas apenas quando usar_data_automatica = False
+data_inicio_manual = "2026-09-01"
+data_fim_manual = "2026-09-05"
+
+# ============================================================
+# PERÍODO AUTOMÁTICO - Se "True"
+# ============================================================
+
+agora = datetime.now(TZ_BR)
+hoje = agora.date()
+
+if usar_data_automatica:
+
+    if hoje.weekday() == 0:
+        # Segunda-feira: busca sexta, sábado e domingo
+        data_inicio = hoje - timedelta(days=3)
+        data_fim = hoje - timedelta(days=1)
+
+    else:
+        # Demais dias: busca ontem até hoje
+        data_inicio = hoje - timedelta(days=1)
+        data_fim = hoje
+
+    modo_data = "AUTOMÁTICO"
+
+else:
+
+    data_inicio = datetime.strptime(
+        data_inicio_manual,
+        "%Y-%m-%d"
+    ).date()
+
+    data_fim = datetime.strptime(
+        data_fim_manual,
+        "%Y-%m-%d"
+    ).date()
+
+    modo_data = "MANUAL"
+
+dia_semana = dias_semana[hoje.weekday()]
+
+print(
+    f"📅 Modo: {modo_data} | "
+    f"Buscando dados entre {data_inicio} e {data_fim} "
+    f"(hoje é {dia_semana})"
+)
+
+
+
+query_pedidos_big_lojas = """
+WITH base AS (
+  SELECT
+    tarefa_id,
+    platforma,
+    tipo,
+    marca_id,
+    marca_nome,
+    pedido_id,
+    pedido_integrado,
+    pedido_aprovado,
+    valor,
+    loja_id,
+    loja_nome,
+    usuario_id,
+    usuario_email,
+    usuario_nome,
+    usuario_tipo,
+    quantidade_itens,
+    pedido_criado_em,
+    modified_at,
+    pedido_modificado_em
+  FROM `projeto.dataset.big_pedidos`
+  WHERE modified_at IS NOT NULL
+
+    AND pedido_criado_em >= DATETIME(@data_inicio)
+    AND pedido_criado_em < DATETIME(DATE_ADD(@data_fim, INTERVAL 1 DAY))
+
+    AND pais = 'BR'
+    AND pedido_integrado = TRUE
+    AND pedido_aprovado = TRUE
+
+    AND marca_id IN (
+    1042783, 1589342, 2046175, 2378561,
+    3190478, 3627194, 4185630, 4732086,
+    5269147, 6843721, 7310584, 8921463
+    )
+),
+
+winning_id AS (
+  SELECT
+    pedido_id,
+    usuario_id AS winning_id
+  FROM base
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY pedido_id
+    ORDER BY pedido_criado_em ASC, pedido_modificado_em DESC
+  ) = 1
+),
+
+dedup AS (
+  SELECT
+    b.*
+  FROM base b
+  INNER JOIN winning_id wp
+    ON b.pedido_id = wp.pedido_id
+   AND b.usuario_id = wp.winning_id
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY b.pedido_id
+    ORDER BY b.pedido_modificado_em DESC
+  ) = 1
+)
+
+SELECT
+  tarefa_id,
+  platforma,
+  tipo,
+  marca_id,
+  marca_nome,
+  pedido_id,
+  pedido_integrado,
+  pedido_aprovado,
+  valor,
+  loja_id,
+  loja_nome,
+  usuario_id,
+  usuario_email,
+  usuario_nome,
+  usuario_tipo,
+  quantidade_itens,
+  pedido_criado_em,
+  pedido_modificado_em
+FROM dedup
+"""
+
+job_config = bigquery.QueryJobConfig(
+    query_parameters=[
+        bigquery.ScalarQueryParameter(
+            "data_inicio",
+            "DATE",
+            data_inicio
+        ),
+        bigquery.ScalarQueryParameter(
+            "data_fim",
+            "DATE",
+            data_fim
+        )
+    ]
+)
+
+df_pedidos_big_lojas = (
+    bq_client
+    .query(query_pedidos_big_lojas, job_config=job_config)
+    .to_dataframe(create_bqstorage_client=False)
+)
+
+print(f"Linhas retornadas de pedidos: {len(df_pedidos_big_lojas)}")
+
+df_pedidos_big_lojas.head(3)
+
+
+
+query_pedidos_mini_lojas = """
+WITH base AS (
+  SELECT
+    tarefa_id,
+    platforma,
+    tipo,
+    marca_id,
+    marca_nome,
+    pedido_id,
+    pedido_integrado,
+    pedido_aprovado,
+    valor,
+    loja_id,
+    loja_nome,
+    usuario_id,
+    usuario_email,
+    usuario_nome,
+    usuario_tipo,
+    quantidade_itens,
+    pedido_criado_em,
+    modified_at,
+    pedido_modificado_em
+  FROM `projeto.dataset.mini_pedidos`
+  WHERE modified_at IS NOT NULL
+
+    AND pedido_criado_em >= DATETIME(@data_inicio)
+    AND pedido_criado_em < DATETIME(DATE_ADD(@data_fim, INTERVAL 1 DAY))
+
+    AND pais = 'BR'
+    AND pedido_integrado = TRUE
+    AND pedido_aprovado = TRUE
+
+    AND marca_id IN (
+    10427, 15893, 20461, 23785,
+    31904, 36271, 41856, 47320,
+    52691, 68437, 73105, 89214
+    )
+),
+
+winning_id AS (
+  SELECT
+    pedido_id,
+    usuario_id AS winning_id
+  FROM base
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY pedido_id
+    ORDER BY pedido_criado_em ASC, pedido_modificado_em DESC
+  ) = 1
+),
+
+dedup AS (
+  SELECT
+    b.*
+  FROM base b
+  INNER JOIN winning_id wp
+    ON b.pedido_id = wp.pedido_id
+   AND b.usuario_id = wp.winning_id
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY b.pedido_id
+    ORDER BY b.pedido_modificado_em DESC
+  ) = 1
+)
+
+SELECT
+  tarefa_id,
+  platforma,
+  tipo,
+  marca_id,
+  marca_nome,
+  pedido_id,
+  pedido_integrado,
+  pedido_aprovado,
+  valor,
+  loja_id,
+  loja_nome,
+  usuario_id,
+  usuario_email,
+  usuario_nome,
+  usuario_tipo,
+  quantidade_itens,
+  pedido_criado_em,
+  pedido_modificado_em
+FROM dedup
+"""
+
+job_config = bigquery.QueryJobConfig(
+    query_parameters=[
+        bigquery.ScalarQueryParameter(
+            "data_inicio",
+            "DATE",
+            data_inicio
+        ),
+        bigquery.ScalarQueryParameter(
+            "data_fim",
+            "DATE",
+            data_fim
+        )
+    ]
+)
+
+df_pedidos_mini_lojas = (
+    bq_client
+    .query(query_pedidos_mini_lojas, job_config=job_config)
+    .to_dataframe(create_bqstorage_client=False)
+)
+
+print(f"Linhas retornadas de pedidos: {len(df_pedidos_mini_lojas)}")
+
+df_pedidos_mini_lojas.head(3)
+
+
+
+query_pedidos_lojas_prime = """
+WITH base AS (
+  SELECT
+    tarefa_id,
+    platforma,
+    tipo,
+    marca_id,
+    marca_nome,
+    pedido_id,
+    pedido_integrado,
+    pedido_aprovado,
+    valor,
+    loja_id,
+    loja_nome,
+    usuario_id,
+    usuario_email,
+    usuario_nome,
+    usuario_tipo,
+    quantidade_itens,
+    pedido_criado_em,
+    modified_at,
+    pedido_modificado_em
+  FROM `projeto.dataset.prime_pedidos`
+  WHERE modified_at IS NOT NULL
+
+    AND pedido_criado_em >= DATETIME(@data_inicio)
+    AND pedido_criado_em < DATETIME(DATE_ADD(@data_fim, INTERVAL 1 DAY))
+
+    AND pais = 'BR'
+    AND pedido_integrado = TRUE
+    AND pedido_aprovado = TRUE
+
+),
+
+winning_id AS (
+  SELECT
+    pedido_id,
+    usuario_id AS winning_id
+  FROM base
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY pedido_id
+    ORDER BY pedido_criado_em ASC, pedido_modificado_em DESC
+  ) = 1
+),
+
+dedup AS (
+  SELECT
+    b.*
+  FROM base b
+  INNER JOIN winning_id wp
+    ON b.pedido_id = wp.pedido_id
+   AND b.usuario_id = wp.winning_id
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY b.pedido_id
+    ORDER BY b.pedido_modificado_em DESC
+  ) = 1
+)
+
+SELECT
+  tarefa_id,
+  platforma,
+  tipo,
+  marca_id,
+  marca_nome,
+  pedido_id,
+  pedido_integrado,
+  pedido_aprovado,
+  valor,
+  loja_id,
+  loja_nome,
+  usuario_id,
+  usuario_email,
+  usuario_nome,
+  usuario_tipo,
+  quantidade_itens,
+  pedido_criado_em,
+  pedido_modificado_em
+FROM dedup
+"""
+
+job_config = bigquery.QueryJobConfig(
+    query_parameters=[
+        bigquery.ScalarQueryParameter(
+            "data_inicio",
+            "DATE",
+            data_inicio
+        ),
+        bigquery.ScalarQueryParameter(
+            "data_fim",
+            "DATE",
+            data_fim
+        )
+    ]
+)
+
+df_pedidos_lojas_prime = (
+    bq_client
+    .query(query_pedidos_lojas_prime, job_config=job_config)
+    .to_dataframe(create_bqstorage_client=False)
+)
+
+print(f"Linhas retornadas de pedidos: {len(df_pedidos_lojas_prime)}")
+
+df_pedidos_lojas_prime.head(3)
+
+
+
+df_pedidos_mini_lojas = spark.createDataFrame(df_pedidos_mini_lojas)
+df_pedidos_big_lojas = spark.createDataFrame(df_pedidos_big_lojas)
+df_pedidos_lojas_prime = spark.createDataFrame(df_pedidos_lojas_prime)
+
+
+df_pedidos = (
+    df_pedidos_mini_lojas
+    .unionByName(df_pedidos_big_lojas)
+    .unionByName(df_pedidos_lojas_prime)
+)
+
+
+
+query_pagamentos_realizados = r"""
+WITH base AS (
+  SELECT
+    pais,
+    id,
+    tarefa_id,
+    pedido_id,
+    status,
+    detalhes_pagamento,
+    tipo_transacao,
+    criado_em,
+    loja_id,
+    usuario_id,
+    responsavel_pagamento_nome AS processador,
+    COALESCE(
+      REGEXP_EXTRACT(detalhes_pagamento, r'tarefa:\s*([A-Za-z0-9\-]+)\s*na loja'),
+      REGEXP_EXTRACT(detalhes_pagamento, r'referente ao pedido\s*([A-Za-z0-9\-]+)\s*no dia')
+    ) AS order_payment_completo
+  FROM
+    `projeto.dataset.pagamentos_realizados`
+  WHERE
+    criado_em >= DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 15 DAY)
+    AND pais = 'BR'
+    AND responsavel_pagamento_nome IS NOT NULL
+    AND NOT REGEXP_CONTAINS(detalhes_pagamento, r'(?i)Bonificacao|Reembolso')
+)
+SELECT
+    pais,
+    id,
+    tarefa_id,
+    pedido_id,
+    status,
+    detalhes_pagamento,
+    tipo_transacao,
+    criado_em,
+    loja_id,
+    usuario_id,
+    responsavel_pagamento_nome AS processador,
+  NULLIF(REGEXP_REPLACE(pedido_id, r'[^0-9]', ''), '') AS pedido_id_somente_numeros,
+  usuario_id,
+  processador
+FROM base
+QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY criado_em DESC) = 1
+"""
+
+df_pagamentos = (
+    spark.read
+    .format("bigquery")
+    .option("viewsEnabled", "true")
+    .option("query", query_pagamentos_realizados)
+    .load()
+)
+
+print(f"Linhas retornadas de pagamentos: {df_pagamentos.count():,}")
+
+df_pagamentos.show(3, truncate=False)
+
+
+
+df_pagamentos = df_pagamentos.filter(
+    (
+        F.col("pedido_id").isNotNull()
+        & (F.trim(F.col("pedido_id")) != "")
+    )
+    |
+    (
+        F.col("pedido_id_somente_numeros").isNotNull()
+        & (F.trim(F.col("pedido_id_somente_numeros")) != "")
+    )
+)
+
+
+
+def normalizar_id(col):
+    valor = F.trim(col.cast("string"))
+    valor = F.regexp_replace(valor, r"\.0$", "")
+    return (
+        F.when(col.isNull() | (valor == ""), F.lit(None))
+        .otherwise(valor)
+    )
+
+
+def somente_numeros(col):
+    valor = F.regexp_replace(normalizar_id(col), r"[^0-9]", "")
+    return (
+        F.when(valor == "", F.lit(None))
+        .otherwise(valor)
+    )
+
+
+df_pedidos_norm = (
+    df_pedidos
+    .withColumn("pedido_id__norm", normalizar_id(F.col("pedido_id")))
+    .withColumn("pedido_id_somente_numeros__norm", somente_numeros(F.col("pedido_id")))
+    .withColumn("usuario_id__norm", normalizar_id(F.col("usuario_id")))
+    .withColumn("pedido_id__chave", F.coalesce(F.col("pedido_id_somente_numeros__norm"), F.col("pedido_id__norm")))
+)
+
+df_pagamentos_norm = (
+    df_pagamentos
+    .withColumn("pedido_id__norm", normalizar_id(F.col("pedido_id")))
+    .withColumn("pedido_id_somente_numeros__norm", somente_numeros(F.col("pedido_id")))
+    .withColumn("usuario_id__norm", normalizar_id(F.col("usuario_id")))
+    .withColumn("pedido_id__chave", F.coalesce(F.col("pedido_id_somente_numeros__norm"), F.col("pedido_id__norm")))
+    .select(
+        F.col("pedido_id__chave").alias("pedido_id__chave"),
+        F.col("usuario_id__norm").alias("usuario_id__norm"),
+        F.col("status").alias("pagamento_status"),
+        F.col("criado_em").alias("pagamento_criado_em"),
+        F.col("processador").alias("pagamento_processador"),
+    )
+)
+
+window_pagamentos = (
+    Window
+    .partitionBy("pedido_id__chave", "usuario_id__norm")
+    .orderBy(F.when(F.lower(F.col("pagamento_status")) == "paid", F.lit(1)).otherwise(F.lit(0)).desc())
+)
+
+df_pagamentos_lookup = (
+    df_pagamentos_norm
+    .filter(F.col("pedido_id__chave").isNotNull() & F.col("usuario_id__norm").isNotNull())
+    .withColumn("_rn", F.row_number().over(window_pagamentos))
+    .filter(F.col("_rn") == 1)
+    .drop("_rn")
+)
+
+p = df_pedidos_norm.alias("p")
+w = df_pagamentos_lookup.alias("w")
+
+condicao_match = (
+    (F.col("p.pedido_id__chave") == F.col("w.pedido_id__chave")) &
+    (F.col("p.usuario_id__norm") == F.col("w.usuario_id__norm"))
+)
+
+df_resultado = p.join(w, on=condicao_match, how="left").drop(F.col("w.pedido_id__chave"), F.col("w.usuario_id__norm"))
+
+df_resultado_pagamentos = df_resultado.withColumn(
+    "payment_status_final",
+    F.when(F.col("pagamento_status").isNotNull(), F.lit("paid")).otherwise(F.lit("pending")),
+)
+
+df_resultado_pagamentos.show(20, truncate=False)
+
+
+
+PASTA_ANALISE_ID = "[caminho da pasta do Google Drive onde o arquivo será salvo]"
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+nome_arquivo = f"analise_de_pagamentos_{timestamp}.csv"
+
+pasta_temporaria = f"/tmp/analise_pagamentos_{timestamp}"
+
+(
+    df_resultado_pagamentos
+    .coalesce(1)
+    .write
+    .mode("overwrite")
+    .option("header", "true")
+    .option("encoding", "UTF-8")
+    .csv(pasta_temporaria)
+)
+
+
+arquivos_csv = glob.glob(
+    os.path.join(pasta_temporaria, "part-*.csv")
+)
+
+if not arquivos_csv:
+    raise FileNotFoundError(
+        f"Nenhum arquivo CSV encontrado em {pasta_temporaria}"
+    )
+
+arquivo_spark = arquivos_csv[0]
+
+
+
+shutil.copy(
+    arquivo_spark,
+    nome_arquivo
+)
+
+
+drive_service = build(
+    "drive",
+    "v3",
+    credentials=creds
+)
+
+
+metadata = {
+    "name": nome_arquivo,
+    "parents": [PASTA_ANALISE_ID]
+}
+
+
+media = MediaFileUpload(
+    nome_arquivo,
+    mimetype="text/csv",
+    resumable=True
+)
+
+
+arquivo = (
+    drive_service
+    .files()
+    .create(
+        body=metadata,
+        media_body=media,
+        fields="id, webViewLink",
+        supportsAllDrives=True,
+    )
+    .execute()
+)
+
+
+
+if os.path.exists(nome_arquivo):
+    os.remove(nome_arquivo)
+
+if os.path.exists(pasta_temporaria):
+    shutil.rmtree(
+        pasta_temporaria,
+        ignore_errors=True
+    )
+
+
+print(f"Salvo no Drive: {nome_arquivo}")
+print(f"ID: {arquivo.get('id')}")
+print(f"Link: {arquivo.get('webViewLink')}")
+
+
+
+antes = df_resultado_pagamentos.count()
+
+df_resultado_pagamentos = (
+    df_resultado_pagamentos
+    .filter(F.col("matched_on").isNull())
+)
+
+depois = df_resultado_pagamentos.count()
+removidas = antes - depois
+
+print(f"Antes: {antes} linhas")
+print(f"Removidas com match: {removidas} linhas")
+print(f"Restantes sem match: {depois} linhas")
+
+
+
+LOJAS_REJEITADAS = {
+
+    '10427': {
+        'nome': 'Trovao',
+        'store_id': [
+            '701000001', '701000002', '701000003', '701000004',
+            '701000005', '701000006', '701000007'
+        ]
+    },
+
+    '15893': {
+        'nome': 'Bravante',
+        'store_id': [
+            '702000001', '702000002', '702000003'
+        ]
+    },
+
+    '20461': {
+        'nome': 'Clarim',
+        'store_id': [
+            '703000001', '703000002', '703000003',
+            '703000004', '703000005'
+        ]
+    },
+
+    '23785': {
+        'nome': 'Vendaval',
+        'store_id': [
+            '704000001', '704000002', '704000003', '704000004', '704000005',
+            '704000006', '704000007', '704000008', '704000009', '704000010',
+            '704000011', '704000012', '704000013', '704000014', '704000015',
+            '704000066', '704000067', '704000068', '704000069', '704000070',
+            '704000071', '704000072', '704000073', '704000074', '704000075',
+            '704000076', '704000077', '704000078', '704000079', '704000080',
+            '704000081', '704000082', '704000083', '704000084', '704000085',
+            '704000086', '704000087', '704000088', '704000089', '704000090'
+        ]
+    },
+
+    '31904': {
+        'nome': 'Cangaceiro',
+        'store_id': [
+            '705000001', '705000002', '705000003'
+        ]
+    },
+
+    '36271': {
+        'nome': 'Fagulha',
+        'store_id': []
+    },
+
+    '41856': {
+        'nome': 'Alvorada',
+        'store_id': [
+            '707000001', '707000002', '707000003', '707000004', '707000005',
+            '707000006', '707000007', '707000008', '707000009', '707000010',
+            '707000011'
+        ]
+    },
+
+    '47320': {
+        'nome': 'Girassol',
+        'store_id': [
+            '708000001', '708000002', '708000003', '708000004', '708000005',
+            '708000006', '708000007', '708000008', '708000009', '708000010',
+            '708000011', '708000012', '708000013'
+        ]
+    },
+
+    '52691': {
+        'nome': 'Marambaia',
+        'store_id': [
+            '709000001', '709000002', '709000003', '709000004', '709000005',
+            '709000006', '709000007', '709000008', '709000009', '709000010'
+        ]
+    },
+
+    '68437': {
+        'nome': 'Lagoa Franca',
+        'store_id': [
+            '710000001', '710000002', '710000003', '710000004'
+        ]
+    },
+
+    '73105': {
+        'nome': 'Cambraia',
+        'store_id': [
+            '711000001', '711000002', '711000003', '711000004',
+            '711000005', '711000006', '711000007', '711000008',
+            '711000009', '711000010', '711000011', '711000012'
+        ]
+    },
+
+    '89214': {
+        'nome': 'Tocaia',
+        'store_id': [
+            '712000001', '712000002', '712000003',
+            '712000004', '712000005'
+        ]
+    },
+
+    '1042783': {
+        'nome': 'Sertania',
+        'store_id': [
+            '713000001', '713000002'
+        ]
+    },
+
+    '1589342': {
+        'nome': 'Barravento',
+        'store_id': [
+            '714000001', '714000002', '714000003'
+        ]
+    },
+
+    '2046175': {
+        'nome': 'Passarela',
+        'store_id': [
+            '715000001', '715000002'
+        ]
+    },
+
+    '2378561': {
+        'nome': 'Retumba',
+        'store_id': [
+            '716000001', '716000002'
+        ]
+    }
+
+}
+
+
+
+BONIFICACAO_QUANTIDADE = {
+    '73105': True,
+    '41856': True
+}
+
+LIMITES_POR_BRAND = {
+    '10427':   {'limite': 350, 'nome': 'Trovao'},
+    '15893':   {'limite': 350, 'nome': 'Bravante'},
+    '20461':   {'limite': 100, 'nome': 'Clarim'},
+    '23785':   {'limite': 100, 'nome': 'Vendaval'},
+    '31904':   {'limite': 100, 'nome': 'Cangaceiro'},
+    '36271':   {'limite': 100, 'nome': 'Fagulha'},
+    '41856':   {'limite': 100, 'nome': 'Alvorada'},
+    '47320':   {'limite': 100, 'nome': 'Girassol'},
+    '52691':   {'limite': 100, 'nome': 'Marambaia'},
+    '68437':   {'limite': 100, 'nome': 'Lagoa Franca'},
+    '73105':   {'limite': 100, 'nome': 'Cambraia'},
+    '89214':   {'limite': 100, 'nome': 'Tocaia'},
+    '1042783': {'limite': 100, 'nome': 'Sertania'},
+    '1589342': {'limite': 100, 'nome': 'Barravento'},
+    '2046175': {'limite': 100, 'nome': 'Passarela'},
+    '2378561': {'limite': 100, 'nome': 'Retumba'},
+    '3190478': {'limite': 300, 'nome': 'Zunido'},
+    '3627194': {'limite': 100, 'nome': 'Grão de Sol'},
+    '4185630': {'limite': 100, 'nome': 'Estopim'},
+    '4732086': {'limite': 100, 'nome': 'Rapadura'},
+    '5269147': {'limite': 100, 'nome': 'Marrimbondo'},
+    '6843721': {'limite': 100, 'nome': 'Sacolão Feliz'},
+    '7310584': {'limite': 100, 'nome': 'Curupira'},
+    '8921463': {'limite': 100, 'nome': 'Boitatá'},
+    '58234':   {'limite': 100, 'nome': 'Peroba'},
+    '63947':   {'limite': 120, 'nome': 'Jequitibá'},
+    '71829':   {'limite': 120, 'nome': 'Sabiá'},
+    '84503':   {'limite': 120, 'nome': 'Quintal Bom'},
+    '96271':   {'limite': 120, 'nome': 'Areado'},
+    '40158':   {'limite': 120, 'nome': 'Vento Sul'},
+}
+
+
+def calcular_bonus_quantidade(quantity):
+    """Calcula o bônus baseado na quantidade de itens"""
+    if quantity > 70:
+        return 5.00
+    elif quantity >= 50:
+        return 3.00
+    elif quantity > 40:
+        return 1.50
+    return 0.00
+
+
+def to_str_seguro(valor):
+    if valor is None:
+        return None
+    texto = str(valor).strip()
+    if texto.endswith('.0'):
+        texto = texto[:-2]
+    return texto if texto != '' else None
+
+
+
+to_str_seguro_udf = F.udf(to_str_seguro, StringType())
+calcular_bonus_quantidade_udf = F.udf(calcular_bonus_quantidade, DoubleType())
+
+limites_map = F.create_map([F.lit(x) for x in chain.from_iterable(
+    (b, info['limite']) for b, info in LIMITES_POR_BRAND.items()
+)])
+
+bonus_brands_list = list(BONIFICACAO_QUANTIDADE.keys())
+
+pares_bloqueados_ifood = [
+    (brand, loja)
+    for brand, info in LOJAS_REJEITADAS.items()
+    for loja in info['store_id']
+]
+df_pares_bloqueados = spark.createDataFrame(
+    pares_bloqueados_ifood, ['marca_id_bloqueada', 'loja_id_bloqueada']
+)
+
+df_resultado_pagamentos = (
+    df_resultado_pagamentos
+    .withColumn('marca_id_str', to_str_seguro_udf(F.col('marca_id')))
+    .withColumn('loja_id_str', to_str_seguro_udf(F.col('loja_id')))
+    .withColumn('platforma_str', F.trim(F.col('platforma').cast('string')))
+    .withColumn('quantity', F.coalesce(F.col('quantidade_itens').cast('int'), F.lit(0)))
+)
+
+df_resultado_pagamentos = (
+    df_resultado_pagamentos
+    .join(
+        F.broadcast(df_pares_bloqueados),
+        (F.col('marca_id_str') == F.col('marca_id_bloqueada')) &
+        (F.col('loja_id_str') == F.col('loja_id_bloqueada')),
+        how='left'
+    )
+    .withColumn(
+        'mask_ifood',
+        (F.lower(F.col('platforma_str')) == 'ifood') & F.col('marca_id_bloqueada').isNotNull()
+    )
+    .drop('marca_id_bloqueada', 'loja_id_bloqueada')
+)
+
+df_resultado_pagamentos = (
+    df_resultado_pagamentos
+    .withColumn('limite_do_brand', limites_map[F.col('marca_id_str')])
+    .withColumn(
+        'mask_limite',
+        F.col('limite_do_brand').isNotNull() & (F.col('quantity') > F.col('limite_do_brand'))
+    )
+)
+
+df_resultado_pagamentos = df_resultado_pagamentos.withColumn(
+    'bonus_quantidade',
+    F.when(
+        F.col('marca_id_str').isin(bonus_brands_list),
+        calcular_bonus_quantidade_udf(F.col('quantity'))
+    ).otherwise(F.lit(0.0))
+)
+
+df_rejeitadas_ifood = df_resultado_pagamentos.filter(F.col('mask_ifood'))
+df_rejeitadas_limite = df_resultado_pagamentos.filter(F.col('mask_limite'))
+df_resultado_pagamentos = df_resultado_pagamentos.filter(~F.col('mask_limite'))
+
+print("Resumo do processamento:")
+print(f"  - Rejeitadas iFood (lojas especificas): {df_rejeitadas_ifood.count()}")
+print(f"  - Rejeitadas por limite de quantidade: {df_rejeitadas_limite.count()}")
+print(f"  - Com bonus de quantidade: {df_resultado_pagamentos.filter(F.col('bonus_quantidade') > 0).count()}")
+print(f"  - Aprovadas para processamento: {df_resultado_pagamentos.count()}")
+
+
+
+PASTA_DESTINO_ID = '7kNpX2QwLmZ9-Vb4TgYoUeRj6HcSaDf8P'
+
+gc = gspread.authorize(creds)
+
+nome_planilha = f"pagamentos_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+planilha = gc.create(nome_planilha, folder_id=PASTA_DESTINO_ID)
+print(f"Planilha criada: {nome_planilha}")
+print(f"URL: https://docs.google.com/spreadsheets/d/{planilha.id}")
+
+
+def valor_serializavel(v):
+    if pd.isna(v):
+        return ''
+    if isinstance(v, pd.Timestamp):
+        return v.strftime('%Y-%m-%d %H:%M:%S')
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.floating):
+        return float(v)
+    if isinstance(v, np.bool_):
+        return bool(v)
+    return v
+
+
+# Converte os DataFrames Spark para pandas antes de exportar
+# (gspread precisa dos dados coletados localmente, não distribuídos)
+df_pedidos_pd = df_resultado_pagamentos.toPandas()
+df_rejeitadas_ifood_pd = df_rejeitadas_ifood.toPandas()
+df_rejeitadas_limite_pd = df_rejeitadas_limite.toPandas()
+
+dataframes_para_exportar = {
+    'pedidos': df_pedidos_pd,
+    'rejeitadas_ifood': df_rejeitadas_ifood_pd,
+    'rejeitadas_limite': df_rejeitadas_limite_pd,
+}
+
+primeira = True
+for nome_aba, df in dataframes_para_exportar.items():
+    n_linhas = max(len(df) + 10, 100)
+    n_colunas = max(len(df.columns) + 5, 20)
+
+    if primeira:
+        aba = planilha.sheet1
+        aba.update_title(nome_aba)
+        aba.resize(rows=n_linhas, cols=n_colunas)
+        primeira = False
+    else:
+        aba = planilha.add_worksheet(title=nome_aba, rows=n_linhas, cols=n_colunas)
+
+    cabecalho = df.columns.tolist()
+    if df.empty:
+        aba.update([cabecalho], value_input_option='USER_ENTERED')
+        print(f"  aba '{nome_aba}': 0 linhas (so cabecalho)")
+        continue
+
+    linhas = [[valor_serializavel(v) for v in linha] for linha in df.values.tolist()]
+    aba.update([cabecalho] + linhas, value_input_option='USER_ENTERED')
+    print(f"  aba '{nome_aba}': {len(df)} linhas exportadas")
+
+print("\nExportacao concluida.")
+
+
+
+PASTA_LOG_ID = '1TuZ39Obe270D2OgCU8lL-0-BVFn0vLhm'
+NOME_LOG = 'LOG'
+
+about = drive_service.about().get(fields='user').execute()
+nome_processador = about['user']['displayName']
+email_processador = about['user']['emailAddress']
+
+agora = datetime.now()
+
+query = (
+    f"name='{NOME_LOG}' and mimeType='application/vnd.google-apps.spreadsheet' "
+    f"and '{PASTA_LOG_ID}' in parents and trashed=false"
+)
+resultado = drive_service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+arquivos_log = resultado.get('files', [])
+
+cabecalho = ['data', 'hora', 'nome_processador', 'email_processador',
+             'nome_arquivo_analise', 'link_arquivo_analise',
+             'nome_planilha_historico', 'link_planilha_historico',
+             'qtd_aprovadas', 'qtd_rejeitadas_ifood', 'qtd_rejeitadas_limite']
+
+if arquivos_log:
+    planilha_log = gc.open_by_key(arquivos_log[0]['id'])
+    aba_log = planilha_log.sheet1
+else:
+    planilha_log = gc.create(NOME_LOG, folder_id=PASTA_LOG_ID)
+    aba_log = planilha_log.sheet1
+    aba_log.update([cabecalho], value_input_option='USER_ENTERED')
+
+# Contagens calculadas via Spark (uma única vez, evitando recomputar)
+qtd_aprovadas = df_resultado_pagamentos.count()
+qtd_rejeitadas_ifood = df_rejeitadas_ifood.count()
+qtd_rejeitadas_limite = df_rejeitadas_limite.count()
+
+nova_linha = [
+    agora.strftime('%Y-%m-%d'),
+    agora.strftime('%H:%M:%S'),
+    nome_processador,
+    email_processador,
+    nome_arquivo,
+    arquivo.get('webViewLink'),
+    nome_planilha,
+    f"https://docs.google.com/spreadsheets/d/{planilha.id}",
+    qtd_aprovadas,
+    qtd_rejeitadas_ifood,
+    qtd_rejeitadas_limite,
+]
+
+aba_log.append_row(nova_linha, value_input_option='USER_ENTERED')
+print(f"Linha adicionada ao LOG: {planilha_log.url}")
+
+
+
+PLANILHA_ID = '1KpXmZ4QvTnR8sYbLc2Wj9AeDfGhI3oNaUrEt5VxCqM'
+PLANILHA_PAGAMENTO_ID = '1FbNw7RtYpLxKq2VdSm4Zj8HcAeUo6GiTn3XyBrQfWs'
+PLANILHA_PRICING_ = '1LzQx3MpVaR9NfTcYo5WjSuHbGe8DiAkUn2XrCtBqZm'
+ABA_DESTINO_NOME = 'Manual_Tarefas'
+ABA_PAGAMENTOS_NOME = 'Pagamentos_Terceiros'
+ABA_BRAZIL_DATA_NOME = 'Pagamentos_AppSheet_Brazil'
+TAMANHO_LOTE = 5000
+
+
+
+TZ_ORIGEM_DADOS = 'America/New_York'
+TZ_NEGOCIO = 'America/Sao_Paulo'
+
+
+def converter_e_extrair_data_brasil(df, coluna_origem, coluna_destino='data_pedido_brasil'):
+    ts_bruto = F.col(coluna_origem).cast('timestamp')
+    ts_utc = F.to_utc_timestamp(ts_bruto, TZ_ORIGEM_DADOS)
+    ts_brasil = F.from_utc_timestamp(ts_utc, TZ_NEGOCIO)
+    df = df.withColumn('_ts_brasil_tmp', ts_brasil)
+    df = df.withColumn(coluna_destino, F.date_format(F.col('_ts_brasil_tmp'), 'yyyy-MM-dd'))
+    return df.drop('_ts_brasil_tmp')
+
+
+def listar_feriados_nacionais(ano_inicio, ano_fim):
+    import holidays
+    br_nacional = holidays.Brazil(years=range(ano_inicio, ano_fim + 1))
+    return sorted(d.strftime('%Y-%m-%d') for d in br_nacional.keys())
+
+
+def classificar_tipo_dia(df, coluna_data_origem, ano_inicio, ano_fim, spark, prefixo='data'):
+    feriados = listar_feriados_nacionais(ano_inicio, ano_fim)
+    df_feriados = spark.createDataFrame([(d,) for d in feriados], ['data_feriado'])
+
+    df = df.withColumn('_data_valida', F.to_date(F.col(coluna_data_origem), 'yyyy-MM-dd'))
+    df = df.join(
+        F.broadcast(df_feriados),
+        F.col(coluna_data_origem) == F.col('data_feriado'),
+        how='left',
+    )
+
+    dia_semana_num = F.dayofweek(F.col('_data_valida'))
+
+    df = df.withColumn(
+        f'{prefixo}_tipo_dia',
+        F.when(F.col('_data_valida').isNull(), F.lit('indefinido'))
+         .when(F.col('data_feriado').isNotNull(), F.lit('feriado'))
+         .when(dia_semana_num == 1, F.lit('domingo'))
+         .when(dia_semana_num == 6, F.lit('sexta'))
+         .when(dia_semana_num == 7, F.lit('sabado'))
+         .otherwise(F.lit('semana'))
+    )
+
+    return df.drop('_data_valida', 'data_feriado')
+
+
+def calcular_data_exportacao():
+    agora_brasil = datetime.now(ZoneInfo(TZ_NEGOCIO))
+    if agora_brasil.hour < 4:
+        return (agora_brasil - timedelta(days=1)).date()
+    return agora_brasil.date()
+
+
+
+df_resultado_pagamentos = converter_e_extrair_data_brasil(
+    df_resultado_pagamentos,
+    coluna_origem='pedido_criado_em',
+    coluna_destino='data_pedido_brasil',
+)
+
+df_resultado_pagamentos = classificar_tipo_dia(
+    df_resultado_pagamentos,
+    coluna_data_origem='data_pedido_brasil',
+    ano_inicio=2022, ano_fim=2026, spark=spark, prefixo='pedido',
+)
+
+
+
+COLUNAS_ORIGEM_PRICING = [
+    'Tipo', 'Modal', 'Brand', 'Brand ID', 'Store ID', 'Nome',
+    'Base', 'Base (sku)', 'Variavel',
+    'Base Sexta', 'Variavel Sexta',
+    'Base Sabado', 'Variavel Sabado',
+    'Base Domingo', 'Variavel Domingo',
+    'Base Feriado', 'Variavel Feriado',
+]
+
+COLUNAS_NUMERICAS_PRICING = [
+    'Base', 'Base (sku)', 'Variavel',
+    'Base Sexta', 'Variavel Sexta',
+    'Base Sabado', 'Variavel Sabado',
+    'Base Domingo', 'Variavel Domingo',
+    'Base Feriado', 'Variavel Feriado',
+]
+
+
+def _converter_decimal_brasileiro(serie):
+    return pd.to_numeric(
+        serie.astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False),
+        errors='coerce',
+    )
+
+
+def _ler_aba_pricing(sheet, nome_aba, nome_fonte):
+    aba = sheet.worksheet(nome_aba)
+    df = get_as_dataframe(aba, skiprows=2, usecols=range(len(COLUNAS_ORIGEM_PRICING)))
+    df.columns = COLUNAS_ORIGEM_PRICING
+    df['Fonte'] = nome_fonte
+    return df
+
+
+def consolidar_pricing(gc, planilha_pricing_id):
+    sheet = gc.open_by_key(planilha_pricing_id)
+
+    df_store = _ler_aba_pricing(sheet, 'store_pricing', 'store_pricing')
+    df_lojas = _ler_aba_pricing(sheet, 'lojas', 'lojas')
+
+    df_geral = pd.concat([df_store, df_lojas], ignore_index=True)
+
+    for coluna in COLUNAS_NUMERICAS_PRICING:
+        df_geral[coluna] = _converter_decimal_brasileiro(df_geral[coluna])
+
+    df_geral = df_geral.sort_values('Base', ascending=False)
+
+    def _primeiro_nao_vazio(serie):
+        validos = serie.dropna()
+        validos = validos[validos.astype(str).str.strip() != '']
+        return validos.iloc[0] if len(validos) else None
+
+    df_resolvido = (
+        df_geral
+        .groupby(['Brand ID', 'Store ID'], as_index=False)
+        .agg({
+            'Tipo': _primeiro_nao_vazio,
+            'Modal': _primeiro_nao_vazio,
+            'Brand': _primeiro_nao_vazio,
+            'Nome': _primeiro_nao_vazio,
+            **{c: 'first' for c in COLUNAS_NUMERICAS_PRICING},
+        })
+    )
+
+    for coluna in COLUNAS_NUMERICAS_PRICING:
+        df_resolvido[coluna] = df_resolvido[coluna].fillna(0.0)
+
+    df_resolvido = df_resolvido.rename(columns={
+        'Brand ID': 'marca_id',
+        'Store ID': 'loja_id',
+        'Brand': 'marca_nome_pricing',
+        'Nome': 'nome_loja_pricing',
+        'Base': 'qtd_base_semana',
+        'Variavel': 'qtd_variavel_semana',
+        'Base Sexta': 'qtd_base_sexta',
+        'Variavel Sexta': 'qtd_variavel_sexta',
+        'Base Sabado': 'qtd_base_sabado',
+        'Variavel Sabado': 'qtd_variavel_sabado',
+        'Base Domingo': 'qtd_base_domingo',
+        'Variavel Domingo': 'qtd_variavel_domingo',
+        'Base Feriado': 'qtd_base_feriado',
+        'Variavel Feriado': 'qtd_variavel_feriado',
+    })
+    return df_resolvido.sort_values(['marca_id', 'loja_id']).reset_index(drop=True)
+
+
+def _selecionar_colunas_pricing_por_dia(alias_tabela, dia_semana_col):
+    variavel = (
+        F.when(dia_semana_col == 'sexta', F.col(f'{alias_tabela}.qtd_variavel_sexta'))
+         .when(dia_semana_col == 'sabado', F.col(f'{alias_tabela}.qtd_variavel_sabado'))
+         .when(dia_semana_col == 'domingo', F.col(f'{alias_tabela}.qtd_variavel_domingo'))
+         .when(dia_semana_col == 'feriado', F.col(f'{alias_tabela}.qtd_variavel_feriado'))
+         .otherwise(F.col(f'{alias_tabela}.qtd_variavel_semana'))
+    )
+    base = (
+        F.when(dia_semana_col == 'sexta', F.col(f'{alias_tabela}.qtd_base_sexta'))
+         .when(dia_semana_col == 'sabado', F.col(f'{alias_tabela}.qtd_base_sabado'))
+         .when(dia_semana_col == 'domingo', F.col(f'{alias_tabela}.qtd_base_domingo'))
+         .when(dia_semana_col == 'feriado', F.col(f'{alias_tabela}.qtd_base_feriado'))
+         .otherwise(F.col(f'{alias_tabela}.qtd_base_semana'))
+    )
+    return variavel, base
+
+
+def calcular_pagamento_tarefas(df_tarefas, df_pricing, dia_semana_coluna='pedido_tipo_dia'):
+    df_tarefas = df_tarefas.withColumn(
+        'chave_loja_marca',
+        F.concat(F.col('loja_id').cast('string'), F.col('marca_id').cast('string')),
+    )
+    df_pricing = df_pricing.withColumn(
+        'chave_loja_marca',
+        F.concat(F.col('loja_id').cast('string'), F.col('marca_id').cast('string')),
+    )
+
+    dia = F.col(f't.{dia_semana_coluna}')
+
+    df = df_tarefas.alias('t').join(
+        df_pricing.alias('sp'),
+        F.col('t.chave_loja_marca') == F.col('sp.chave_loja_marca'),
+        how='left',
+    )
+
+    variavel_sp, base_sp = _selecionar_colunas_pricing_por_dia('sp', dia)
+    pagamento_bruto = variavel_sp * (F.col('t.quantidade_itens') - base_sp)
+
+    df = df.withColumn(
+        'pagamento_calculado',
+        F.when(F.col('sp.chave_loja_marca').isNull(), F.lit('Brand/Store Não Encontrado'))
+         .otherwise(F.greatest(pagamento_bruto, F.lit(0.0)) + F.coalesce(F.col('t.bonus_quantidade'), F.lit(0.0)))
+    )
+
+    df = df.withColumn(
+        'descricao_pagamento',
+        F.concat(
+            F.lit('Pagamento por produto da tarefa: '), F.col('t.tarefa_id'),
+            F.lit(' na loja: '), F.col('t.loja_id'), F.lit(' - '), F.col('t.loja_nome'),
+            F.lit(' no dia: '), F.date_format(F.col('t.pedido_criado_em'), 'yyyy-MM-dd'),
+        )
+    )
+
+    df = df.withColumn(
+        'tipo_pagamento',
+        F.when(F.col('t.marca_id') == BRAND_ID_BRAVANTE, F.lit(f'{NOME_BRAND_BRAVANTE} PACKING BR'))
+         .when(
+             (F.col('t.marca_id') == BRAND_ID_TROVAO) &
+             (F.col('t.platforma') == SISTEMA_INTEGRADO_FICTICIO),
+             F.lit(f'{NOME_BRAND_TROVAO} INTEGRADO'),
+         )
+         .when(F.col('t.marca_id') == BRAND_ID_TROVAO, F.lit(f'{NOME_BRAND_TROVAO} SEPARADOR'))
+         .when(F.col('t.marca_nome') == f'{NOME_BRAND_TROVAO} ENTREGADOR', F.col('t.marca_nome'))
+         .otherwise(F.col('sp.marca_nome_pricing'))
+    )
+
+    df = df.withColumn(
+        'valor_final',
+        F.when(F.col('pagamento_calculado') == 'Brand/Store Não Encontrado', F.lit('Brand/Store Não Encontrado'))
+         .when(F.col('t.marca_id').isin(BRAND_IDS_SEM_SOMA), F.col('pagamento_calculado'))
+         .otherwise(F.col('t.valor') + F.col('pagamento_calculado'))
+    )
+
+    df = df.withColumn('nome_loja_pricing', F.col('sp.nome_loja_pricing'))
+    df = df.withColumn(
+        'loja_validada',
+        F.when(F.col('sp.chave_loja_marca').isNotNull(), F.col('t.loja_id')),
+    )
+    df = df.withColumn('categoria_pagamento', F.lit('Reward - Picking'))
+
+    return df.drop('chave_loja_marca')
+
+
+df_pricing_pd = consolidar_pricing(gc, PLANILHA_PRICING_)
+df_pricing = spark.createDataFrame(df_pricing_pd)
+
+df_resultado_pagamentos = calcular_pagamento_tarefas(df_resultado_pagamentos, df_pricing)
+
+print(f"Calculo concluido. {df_resultado_pagamentos.filter(F.col('valor_final') == 'Brand/Store Não Encontrado').count()} "
+      f"linha(s) sem correspondencia na planilha de pricing.")
+
+
+
+def limpar_dados_anteriores(aba_destino):
+    total_linhas = aba_destino.row_count
+    print(f"Limpando dados anteriores de '{ABA_DESTINO_NOME}' (A2:W{total_linhas}) "
+          f"antes de colar o lote de hoje...")
+    aba_destino.batch_clear([f'A2:W{total_linhas}'])
+
+
+
+
+BRAND_IDS_ZERO = (10427, 54187, 1042783, 2046175, 15893)
+
+
+def corrigir_valores_zerados_e_recalcular_final(df_com_pagamento_calculado, coluna_base='valor'):
+    print("Verificando valores zerados na coluna valor...")
+
+    valor_numerico = F.col(coluna_base).cast('double')
+    esta_zerado = F.coalesce(valor_numerico == 0.0, F.lit(False))
+
+    qtd_linhas_zeradas = df_com_pagamento_calculado.filter(esta_zerado).count()
+    print(f"Linhas com valor zerado: {qtd_linhas_zeradas}")
+
+    df = df_com_pagamento_calculado.withColumn(
+        coluna_base,
+        F.when(~esta_zerado, F.col(coluna_base))
+         .when(F.col('marca_id').isin(BRAND_IDS_ZERO), F.lit(0.0))
+         .otherwise(F.col(coluna_base))
+    )
+
+    df = df.withColumn(
+        'valor_final',
+        F.when(F.col('pagamento_calculado') == 'Brand/Store Não Encontrado', F.lit('Brand/Store Não Encontrado'))
+         .when(F.col('marca_id').isin(BRAND_IDS_ZERO), F.col('pagamento_calculado'))
+         .otherwise(F.col(coluna_base) + F.col('pagamento_calculado'))
+    )
+
+    print(f"Recalculo concluido em {qtd_linhas_zeradas} linha(s).")
+    return df
+
+
+
+SISTEMA_INTEGRADO = 'SistemaAlfa/PlataformaBeta'
+SISTEMA_INTEGRADO_TYPO = 'SistemaAlfa/PlataformaBta'
+
+
+def _texto_ou_vazio(coluna):
+    return F.when(F.col(coluna).isNull(), F.lit('')).otherwise(F.col(coluna).cast('string'))
+
+
+def _data_yyyy_mm_dd_ou_vazio(coluna):
+    bruto = F.col(coluna).cast('string')
+    ja_no_padrao = bruto.rlike(r'^\d{4}-\d{2}-\d{2}')
+    tem_barra = bruto.contains('/')
+    partes = F.split(bruto, '/')
+    dia = F.lpad(partes.getItem(0), 2, '0')
+    mes = F.lpad(partes.getItem(1), 2, '0')
+    ano = partes.getItem(2)
+    reformatada = F.concat_ws('-', ano, mes, dia)
+    return (
+        F.when(F.col(coluna).isNull(), F.lit(''))
+         .when(ja_no_padrao, bruto.substr(1, 10))
+         .when(tem_barra & (F.size(partes) == 3), reformatada)
+         .otherwise(bruto)
+    )
+
+
+def preparar_dados_colagem(df):
+    return df.select(
+        _data_yyyy_mm_dd_ou_vazio('data_modificacao_local').alias('data_modificacao_local'),
+        _texto_ou_vazio('telefone_contato').alias('telefone_contato'),
+        _texto_ou_vazio('marca_id').alias('marca_id'),
+        _texto_ou_vazio('marca_nome').alias('marca_nome'),
+        _texto_ou_vazio('nome_loja').alias('nome_loja'),
+        _texto_ou_vazio('id_origem_externa').alias('id_origem_externa'),
+        _texto_ou_vazio('id_tarefa').alias('id_tarefa'),
+        F.when(F.col('aprovado').cast('boolean'), F.lit('VERDADEIRO')).otherwise(F.lit('FALSO')).alias('aprovado'),
+        F.coalesce(F.col('valor').cast('double'), F.lit(0.0)).alias('valor'),
+        F.coalesce(F.col('qtd_itens').cast('double').cast('int'), F.lit(0)).alias('qtd_itens'),
+        F.when(F.col('tipo_pedido').isNull(), F.lit(''))
+         .when(F.trim(F.col('tipo_pedido')) == SISTEMA_INTEGRADO_TYPO, F.lit(SISTEMA_INTEGRADO))
+         .otherwise(F.trim(F.col('tipo_pedido')))
+         .alias('tipo_pedido'),
+        _texto_ou_vazio('loja_id').alias('loja_id'),
+        _texto_ou_vazio('data_criacao_local').alias('data_criacao_local'),
+        _texto_ou_vazio('id_metadata').alias('id_metadata'),
+        _texto_ou_vazio('numero_interno').alias('numero_interno'),
+    )
+
+
+def converter_para_dict_colagem(df):
+    pdf = df.toPandas()
+    return {coluna: pdf[coluna].tolist() for coluna in pdf.columns}
+
+
+
+NOMES_GENERICOS = {
+    'root', 'spark', 'hadoop', 'yarn', 'databricks', 'ec2-user',
+    'jupyter', 'jovyan', 'airflow', 'svc', 'service',
+}
+
+
+def _usuario_local_parece_real(nome_usuario):
+    if not nome_usuario:
+        return False
+    nome_normalizado = nome_usuario.strip().lower()
+    if nome_normalizado in NOMES_GENERICOS:
+        return False
+    if 'gserviceaccount' in nome_normalizado or nome_normalizado.endswith('$'):
+        return False
+    return True
+
+
+def obter_execucao_manual():
+    nome_usuario = None
+    try:
+        nome_usuario = getpass.getuser()
+    except Exception:
+        pass
+
+    if not _usuario_local_parece_real(nome_usuario):
+        return None
+
+    try:
+        nome_computador = socket.gethostname()
+    except Exception:
+        nome_computador = 'Desconhecido'
+
+    return {
+        'origem': 'execucao_manual',
+        'usuario': nome_usuario,
+        'computador': nome_computador,
+        'data_hora': datetime.now().isoformat(timespec='seconds'),
+    }
+
+
+def obter_ultimo_editor_arquivo(drive_service, file_id):
+    try:
+        metadados = drive_service.files().get(
+            fileId=file_id,
+            fields='lastModifyingUser(displayName,emailAddress),modifiedTime',
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as erro:
+        return {
+            'origem': 'metadados_arquivo',
+            'usuario': 'Desconhecido',
+            'email': None,
+            'data_hora': None,
+            'erro': str(erro),
+        }
+
+    editor = metadados.get('lastModifyingUser', {})
+    return {
+        'origem': 'metadados_arquivo',
+        'usuario': editor.get('displayName', 'Desconhecido'),
+        'email': editor.get('emailAddress'),
+        'data_hora': metadados.get('modifiedTime'),
+        'erro': None,
+    }
+
+
+def identificar_responsavel(drive_service, file_id):
+    info_manual = obter_execucao_manual()
+    if info_manual is not None:
+        return info_manual
+    return obter_ultimo_editor_arquivo(drive_service, file_id)
+
+
+
+def montar_pagamentos_picking(df_resultados_final, nome_aprovador, data_referencia):
+    return df_resultados_final.select(
+        F.coalesce(F.col('telefone_contato'), F.lit('')).alias('Number'),
+        F.coalesce(F.col('marca_id').cast('string'), F.lit('')).alias('Brand ID'),
+        F.coalesce(F.col('loja_id').cast('string'), F.lit('')).alias('Store ID'),
+        F.lit('Reward - Picking').alias('Reason Type'),
+        F.coalesce(F.col('valor_final').cast('string'), F.lit('')).alias('Payment Value'),
+        F.coalesce(F.col('descricao_pagamento'), F.lit('')).alias('Description'),
+        F.lit(nome_aprovador).alias('aproved'),
+        F.lit(data_referencia).alias('start'),
+        F.lit(data_referencia).alias('end'),
+        F.lit('SIM').alias('enviado'),
+    )
+
+
+def escrever_pagamentos_picking(aba_pagamentos, df_pagamentos_picking):
+    pdf = df_pagamentos_picking.toPandas()
+    total = len(pdf)
+    linha_final_pagamentos = 2 + total - 1
+
+    print(f"Limpando A2:J{aba_pagamentos.row_count} de 'Pagamentos_picking' "
+          f"(remove qualquer residuo de execucoes anteriores)...")
+    aba_pagamentos.batch_clear([f'A2:J{aba_pagamentos.row_count}'])
+
+    print(f"Escrevendo {total} linhas em 'Pagamentos_picking' A2:J{linha_final_pagamentos}...")
+    aba_pagamentos.update(
+        range_name=f'A2:J{linha_final_pagamentos}',
+        values=pdf.values.tolist(),
+        value_input_option="USER_ENTERED",
+    )
+    print(f"Concluido: {total} linhas escritas em 'Pagamentos_picking'.")
+    return total
+
+
+
+
+def verificar_virgulas_payment_value(aba_pagamentos):
+    try:
+        print("\nVerificando virgulas na coluna E (Payment Value) de 'Pagamentos_picking'...")
+        todos_dados = aba_pagamentos.get_all_values()
+        problemas = []
+        for idx, linha in enumerate(todos_dados[1:], start=2):
+            if len(linha) >= 5 and ',' in str(linha[4]):
+                problemas.append({'linha': idx, 'valor': linha[4]})
+        if problemas:
+            print(f"\nATENCAO: Encontrados {len(problemas)} valores com virgula na coluna E:")
+            print(f"\n{'Linha':<10} {'Valor'}")
+            print("-" * 50)
+            for item in problemas:
+                print(f"{item['linha']:<10} {item['valor']}")
+        else:
+            print("Nenhum valor com virgula encontrado na coluna E")
+        return problemas
+    except Exception as e:
+        print(f"Erro ao verificar virgulas: {e}")
+        return []
+
+
+
+PASTA_COPIAS_PRICING_ID = '8fQmZ2LtRkX_NcVo-Yb3JhWdPa9SgEiU1'
+
+PLANILHAS_PARA_COPIAR = {
+    'store_pricing': PLANILHA_PRICING_,
+}
+
+timestamp_copia = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+for apelido, planilha_id in PLANILHAS_PARA_COPIAR.items():
+    nome_original = drive_service.files().get(
+        fileId=planilha_id, fields='name', supportsAllDrives=True
+    ).execute()['name']
+    nome_copia = f"{nome_original} - copia {timestamp_copia}"
+
+    copia = drive_service.files().copy(
+        fileId=planilha_id,
+        body={'name': nome_copia, 'parents': [PASTA_COPIAS_PRICING_ID]},
+        fields='id, name, webViewLink',
+        supportsAllDrives=True,
+    ).execute()
+
+    print(f"Copiada: {copia['name']}")
+    print(f"  Link: {copia.get('webViewLink')}")
+
+
+
+sheet = gc.open_by_key(PLANILHA_ID)
+aba_destino = sheet.worksheet(ABA_DESTINO_NOME)
+aba_pagamentos = sheet.worksheet(ABA_PAGAMENTOS_NOME)
+print(f"Planilha aberta: {sheet.title}")
+
+
+
+
+COLUNAS_TEXTO_BRUTAS = [
+    ('data_modificacao_local', 'A'), ('telefone_contato', 'B'), ('marca_id', 'C'),
+    ('marca_nome', 'D'), ('nome_loja', 'E'), ('id_origem_externa', 'F'),
+    ('id_tarefa', 'G'), ('aprovado', 'H'), ('valor', 'I'), ('qtd_itens', 'J'),
+    ('tipo_pedido', 'Q'), ('loja_id', 'T'), ('data_criacao_local', 'U'),
+    ('id_metadata', 'V'), ('numero_interno', 'W'),
+]
+
+COLUNAS_CALCULADAS = [
+    ('valor_final', 'K'), ('categoria_pagamento', 'L'), ('loja_validada', 'M'),
+    ('valor_coluna_n', 'N'), ('descricao_pagamento', 'O'), ('pagamento_calculado', 'P'),
+    ('tipo_pagamento', 'R'), ('valor_coluna_s', 'S'),
+]
+
+COLUNAS_NUMERICAS = {'valor', 'qtd_itens', 'valor_final', 'valor_coluna_n', 'pagamento_calculado', 'valor_coluna_s'}
+
+COLUNAS_NECESSARIAS = 23
+
+
+def garantir_colunas_suficientes(aba_destino):
+    if aba_destino.col_count < COLUNAS_NECESSARIAS:
+        faltam = COLUNAS_NECESSARIAS - aba_destino.col_count
+        print(f"Aba tem {aba_destino.col_count} colunas, precisa de {COLUNAS_NECESSARIAS} (ate W). "
+              f"Adicionando {faltam} coluna(s)...")
+        aba_destino.add_cols(faltam)
+
+
+def _valor_numerico_ou_texto(v):
+    if pd.isna(v):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return v  # ex: 'Brand/Store Não Encontrado' -- mantem como texto, nao quebra
+
+
+def montar_batch_colagem_completo(pdf, linha_inicial):
+    total = len(pdf)
+    linha_final = linha_inicial + total - 1
+
+    batch_data = []
+    for coluna_df, coluna_letra in COLUNAS_TEXTO_BRUTAS + COLUNAS_CALCULADAS:
+        serie = pdf[coluna_df]
+        if coluna_df in COLUNAS_NUMERICAS:
+            valores = [[_valor_numerico_ou_texto(v)] for v in serie]
+        else:
+            valores = [[''] if pd.isna(v) else [str(v)] for v in serie]
+        batch_data.append({
+            'range': f'{coluna_letra}{linha_inicial}:{coluna_letra}{linha_final}',
+            'values': valores,
+        })
+
+    return batch_data, linha_final, total
+
+
+def colar_resultados_completos(aba_destino, df_final, linha_inicial):
+    todas_colunas = [coluna for coluna, _ in COLUNAS_TEXTO_BRUTAS + COLUNAS_CALCULADAS]
+    pdf = df_final.select(todas_colunas).toPandas()
+
+    print(f"Preparando insercao nas linhas {linha_inicial} a {linha_inicial + len(pdf) - 1} ({len(pdf)} pedidos)...")
+
+    garantir_colunas_suficientes(aba_destino)
+
+    print("Limpando dados anteriores...")
+    aba_destino.batch_clear([f'A2:W{aba_destino.row_count}'])
+
+    print("Montando lote unico (colunas brutas A-J,Q,T-W + colunas calculadas K-P,R-S)...")
+    batch_data, linha_final, total = montar_batch_colagem_completo(pdf, linha_inicial)
+
+    print(f"Enviando {len(batch_data)} intervalo(s) num unico batch_update...")
+    aba_destino.batch_update(batch_data, value_input_option="USER_ENTERED")
+    print("Dados e valores inseridos com sucesso (1 unica chamada de API).")
+
+    return total
+
+
+
+data_hoje = calcular_data_exportacao().strftime('%Y-%m-%d')
+df_pagamentos_picking = montar_pagamentos_picking(df_resultado_pagamentos, nome_aprovador, data_hoje)
+escrever_pagamentos_picking(aba_pagamentos, df_pagamentos_picking)
+verificar_virgulas_payment_value(aba_pagamentos)
+
+
+
+NOME_ABA_CHECKPOINT = 'lotes_brazil_data'
+CABECALHO_CHECKPOINT = ['execucao_id', 'total_linhas', 'status', 'timestamp', 'mensagem_erro']
+
+
+def obter_ou_criar_aba_checkpoint(planilha_log):
+    titulos_existentes = [ws.title for ws in planilha_log.worksheets()]
+    if NOME_ABA_CHECKPOINT in titulos_existentes:
+        return planilha_log.worksheet(NOME_ABA_CHECKPOINT)
+    aba = planilha_log.add_worksheet(title=NOME_ABA_CHECKPOINT, rows=1000, cols=len(CABECALHO_CHECKPOINT))
+    aba.update([CABECALHO_CHECKPOINT], value_input_option='USER_ENTERED')
+    return aba
+
+
+def execucao_ja_enviada(aba_checkpoint, execucao_id):
+    registros = aba_checkpoint.get_all_records()
+    return any(
+        str(r.get('execucao_id')) == str(execucao_id) and r.get('status') == 'enviado'
+        for r in registros
+    )
+
+
+def registrar_checkpoint_execucao(aba_checkpoint, execucao_id, total_linhas, status, mensagem_erro=''):
+    aba_checkpoint.append_row([
+        execucao_id, total_linhas, status,
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'), mensagem_erro,
+    ], value_input_option='USER_ENTERED')
+
+
+def enviar_com_retry(aba_brazil, ranges_e_dados, tentativas_max=5):
+    ultimo_erro = None
+    for tentativa in range(1, tentativas_max + 1):
+        try:
+            for range_name, valores in ranges_e_dados:
+                aba_brazil.update(range_name, valores, value_input_option="USER_ENTERED")
+            return True
+        except Exception as e:
+            ultimo_erro = e
+            if tentativa == tentativas_max:
+                break
+            espera = 5 ** tentativa
+            print(f"  Tentativa {tentativa}/{tentativas_max} falhou ({e}). "
+                  f"Aguardando {espera}s antes de tentar de novo...")
+            time.sleep(espera)
+    raise ultimo_erro
+
+
+def exportar_para_brazil_data(gc, aba_pagamentos_picking, planilha_log, execucao_id,
+                               nome_aprovador, pedir_confirmacao=False):
+    try:
+        print("INICIANDO EXPORTACAO PARA PLANILHA DE PAGAMENTOS")
+
+        aba_checkpoint = obter_ou_criar_aba_checkpoint(planilha_log)
+        if execucao_ja_enviada(aba_checkpoint, execucao_id):
+            print(f"Execucao '{execucao_id}' ja foi exportada anteriormente -- pulando.")
+            return
+
+        print("Carregando dados de 'Pagamentos_picking'...")
+        todos_dados = aba_pagamentos_picking.get_all_values()
+        if len(todos_dados) <= 1:
+            print("Nenhum dado encontrado para exportar")
+            return
+
+        data_hoje = calcular_data_exportacao().strftime('%Y-%m-%d')
+
+        dados_c_h, dados_j_k, dados_i = [], [], []
+        puladas_curtas = puladas_vazias = puladas_sem_match = 0
+
+        for linha in todos_dados[1:]:
+            if not linha or len(linha) < 9:
+                puladas_curtas += 1
+                continue
+            if str(linha[0]).strip() == '':
+                puladas_vazias += 1
+                continue
+            if len(linha) > 4 and str(linha[4]).strip() == 'Brand/Store Não Encontrado':
+                puladas_sem_match += 1
+                continue
+
+            dados_c_h.append([
+                converter_data_export(linha[idx]) if idx in (3, 4) else linha[idx]
+                for idx in range(6)
+            ])
+            dados_j_k.append([data_hoje, data_hoje])
+            dados_i.append([nome_aprovador])
+
+        print(f"Resumo do filtro (de {len(todos_dados) - 1} linhas): "
+              f"curtas={puladas_curtas}, coluna_A_vazia={puladas_vazias}, "
+              f"sem_match={puladas_sem_match}")
+
+        total_linhas = len(dados_c_h)
+        print(f"Total de linhas para exportar: {total_linhas}")
+        if total_linhas == 0:
+            print("Nenhuma linha valida encontrada")
+            return
+
+        sheet_pagamento = gc.open_by_key(PLANILHA_PAGAMENTO_ID)
+        aba_brazil = sheet_pagamento.worksheet(ABA_BRAZIL_DATA_NOME)
+
+        linha_inicial = 2
+        linha_final = linha_inicial + total_linhas - 1
+
+        if pedir_confirmacao:
+            input(f"Pressione ENTER para exportar {total_linhas} linha(s)...")
+
+        aba_brazil.batch_clear([f'A2:B{linha_final}', f'C2:K{linha_final}'])
+
+        dados_a_b = [
+            [
+                f'=SE(ÉCÉL.VAZIA(D{l}), "", SEERRO(PROCV(D{l},\'Reference table\'!$E$4:F,2,FALSO),""))',
+                f'=SEERRO(PROCV(D{l},\'Reference table\'!$E$4:H,4, FALSO),"")',
+            ]
+            for l in range(linha_inicial, linha_final + 1)
+        ]
+
+        ranges_e_dados = [
+            (f'A{linha_inicial}:B{linha_final}', dados_a_b),
+            (f'C{linha_inicial}:H{linha_final}', dados_c_h),
+            (f'I{linha_inicial}:I{linha_final}', dados_i),
+            (f'J{linha_inicial}:K{linha_final}', dados_j_k),
+        ]
+
+        try:
+            enviar_com_retry(aba_brazil, ranges_e_dados)
+            registrar_checkpoint_execucao(aba_checkpoint, execucao_id, total_linhas, status='enviado')
+            print(f"Exportacao concluida: {total_linhas} linha(s) enviada(s).")
+        except Exception as e:
+            registrar_checkpoint_execucao(aba_checkpoint, execucao_id, total_linhas, status='erro',
+                                           mensagem_erro=str(e))
+            print(f"ERRO na exportacao apos todas as tentativas: {e}")
+            return
+
+        print("Coluna L continua sendo preenchida pelo script/automacao externa.")
+    except Exception as e:
+        print(f"Erro ao exportar para Brazil Data: {e}")
+
+
+
+planilha_log = gc.open_by_key("lrHIB9nqVSDl6xu-FLOb_v56f3CfT4NHC")
+print(f"📋 Planilha de log conectada: {planilha_log.title}")
+
+
+
+exportar_para_brazil_data(
+    gc, aba_pagamentos, planilha_log, execucao_id=nome_planilha,
+    nome_aprovador=nome_aprovador,
+    pedir_confirmacao=False,
+)
+
+
+
+APPSHEET_APP_ID = "f47ac10b-58cc-4372-a567-0e02b2c3d479"        
+APPSHEET_ACCESS_KEY = "V2-fAKe1-fAKe2-fAKe3-fAKe4-fAKe5-fAKe6"  
+APPSHEET_TABLE_NAME = "Pagamentos_AppSheet_Brazil"
+APPSHEET_REGION = "www.appsheet.com"
+
+
+def _indice_coluna(letra):
+    _, col = a1_to_rowcol(f"{letra}1")
+    return col
+
+
+def aguardar_planilha_completa(aba_brazil, total_linhas_esperadas, coluna_verificacao='C',
+                                linha_inicial=2, intervalo_segundos=30, tempo_maximo_segundos=3600):
+    tempo_decorrido = 0
+    indice_col = _indice_coluna(coluna_verificacao)
+
+    while tempo_decorrido < tempo_maximo_segundos:
+        valores = aba_brazil.col_values(indice_col)
+        linhas_preenchidas = max(0, len(valores) - (linha_inicial - 1))
+        print(f"Linhas preenchidas: {linhas_preenchidas}/{total_linhas_esperadas} "
+              f"(decorrido: {tempo_decorrido}s)")
+
+        if linhas_preenchidas >= total_linhas_esperadas:
+            print("Planilha completa.")
+            return True
+
+        time.sleep(intervalo_segundos)
+        tempo_decorrido += intervalo_segundos
+
+    print("Tempo maximo de espera atingido sem completar o preenchimento.")
+    return False
+
+
+def disparar_pagamento_appsheet(chaves_linhas, nome_action="ConfirmarPagamento"):
+    url = f"https://{APPSHEET_REGION}/api/v2/apps/{APPSHEET_APP_ID}/tables/{APPSHEET_TABLE_NAME}/Action"
+
+    payload = {
+        "Action": nome_action,
+        "Properties": {"Locale": "pt-BR"},
+        "Rows": [{"Row ID": chave} for chave in chaves_linhas],
+    }
+    headers = {
+        "ApplicationAccessKey": APPSHEET_ACCESS_KEY,
+        "Content-Type": "application/json",
+    }
+
+    resposta = requests.post(url, json=payload, headers=headers, timeout=30)
+    resposta.raise_for_status()
+    return resposta.json()
+
+
+def fluxo_completo_exemplo(aba_brazil, total_linhas_esperadas, chaves_linhas):
+    if not aguardar_planilha_completa(aba_brazil, total_linhas_esperadas):
+        print("Preenchimento nao confirmado -- pagamento NAO disparado.")
+        return None
+
+    print(f"Disparando pagamento para {len(chaves_linhas)} linha(s)...")
+    resultado = disparar_pagamento_appsheet(chaves_linhas)
+    print("Pagamento disparado:", resultado)
+    return resultado
+
+
+
+SLACK_TOKEN = "[chave token]"
+CANAL_SLACK = "[id canal slack]"
+
+dados_manual = aba_destino.get_values(f'A2:W{linha_final}')
+
+colunas = [
+    'data_modificacao_local', 'telefone_contato', 'marca_id', 'marca_nome', 'nome_loja',
+    'id_origem_externa', 'id_tarefa', 'aprovado', 'valor', 'sku_item',
+    'valor_final', 'categoria_pagamento', 'loja_validada', 'endereco_loja', 'descricao_pagamento',
+    'pagamento_calculado', 'tipo_pedido', 'tipo_pagamento', 'nome_loja_pricing',
+    'loja_id', 'data_criacao_local', 'id_submissao', 'numero_pedido',
+]
+df_manual = pd.DataFrame(dados_manual, columns=colunas)
+
+df_manual['data_modificacao_local'] = df_manual['data_modificacao_local'].astype(str).str.strip()
+df_manual = df_manual[df_manual['data_modificacao_local'] != ''].copy()
+
+def to_float(valor):
+    s = str(valor).strip().replace('R$', '').strip()
+    if s == '':
+        return 0.0
+    if ',' in s and '.' in s:
+        s = s.replace('.', '').replace(',', '.')
+    elif ',' in s:
+        s = s.replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+# guarda o valor bruto pra filtrar linhas não resolvidas (Brand/Store Não Encontrado)
+df_manual['valor_final_raw'] = df_manual['valor_final'].astype(str).str.strip()
+df_manual['valor_final'] = df_manual['valor_final_raw'].apply(to_float)
+
+# só entra no resumo quem tem valor de fato resolvido (o que realmente foi pago)
+linha_valida = (
+    (df_manual['valor_final_raw'].str.lower() != 'brand/store não encontrado')
+    & (df_manual['valor_final'] > 0)
+)
+linhas_excluidas = (~linha_valida).sum()
+df_manual = df_manual[linha_valida].copy()
+
+df_manual['loja_id'] = df_manual['loja_id'].astype(str).str.strip()
+df_manual['nome_loja'] = df_manual['nome_loja'].astype(str).str.strip()
+df_manual['telefone_contato'] = df_manual['telefone_contato'].astype(str).str.strip()
+df_manual['chave_loja'] = df_manual['loja_id'] + " - " + df_manual['nome_loja']
+
+def limpar_nome_marca(nome):
+    trechos_para_remover = [
+        " Empacotador",
+        " Separador",
+        " BR",
+    ]
+    resultado = nome
+    for trecho in trechos_para_remover:
+        resultado = resultado.replace(trecho, "")
+    return resultado.strip()
+
+datas = pd.to_datetime(df_manual['data_modificacao_local'], errors='coerce')
+data_min = datas.min().strftime('%d/%m/%Y')
+data_max = datas.max().strftime('%d/%m/%Y')
+periodo_texto = f"no dia {data_min}" if data_min == data_max else f"entre as datas de {data_min} a {data_max}"
+
+total_linhas = len(df_manual)
+total_valor = df_manual['valor_final'].sum()
+total_lojas = df_manual['chave_loja'].nunique()
+total_usuarios = df_manual.loc[df_manual['telefone_contato'] != '', 'telefone_contato'].nunique()
+lojas_texto = ", ".join(sorted(df_manual['chave_loja'].unique()))
+
+marcas_originais = df_manual['marca_nome'].dropna().unique()
+marcas_limpas = [limpar_nome_marca(m) for m in marcas_originais]
+marcas = sorted(set(marcas_limpas))
+marcas_texto = ', '.join(marcas)
+
+resumo_lojas = (
+    df_manual.groupby(['loja_id', 'nome_loja'])
+    .agg(
+        Freelas=('telefone_contato', lambda x: x[x != ''].nunique()),
+        Valor_total=('valor_final', 'sum')
+    )
+    .reset_index()
+    .sort_values('Valor_total', ascending=False)
+)
+
+linhas_tabela = ["Loja_ID | Loja_Nome           | Freelas | R$ Valor total"]
+linhas_tabela.append("-" * 65)
+for _, row in resumo_lojas.iterrows():
+    linhas_tabela.append(
+        f"{row['loja_id']:<9}| {row['nome_loja']:<21}| {row['Freelas']:<11}| R$ {row['Valor_total']:,.2f}"
+    )
+quadro_texto = "\n".join(linhas_tabela)
+
+texto = (
+    f"@canal :alert: - Pagamos {periodo_texto}, "
+    f"o montante de R$ {total_valor:,.2f}, num total de {total_linhas} linhas, "
+    f"das marcas {marcas_texto}, "
+    f"para {total_lojas} lojas, "
+    f"sendo {total_usuarios} freelas, conforme o quadro abaixo:\n"
+    f"```{quadro_texto}```"
+)
+
+print("📋 PRÉVIA DA MENSAGEM QUE SERÁ ENVIADA AO SLACK:\n")
+if linhas_excluidas:
+    print(f"(⚠️ {linhas_excluidas} linha(s) com Brand/Store Não Encontrado excluídas do resumo)\n")
+print(texto)
+print("\n📊 Resumo por loja:")
+display(resumo_lojas)
+
+
+
+
+url = "https://slack.com/api/chat.postMessage"
+headers = {
+    "Authorization": f"Bearer {SLACK_TOKEN}",
+    "Content-Type": "application/json; charset=utf-8"
+}
+payload = {
+    "channel": CANAL_SLACK,
+    "text": texto
+}
+response = requests.post(url, headers=headers, json=payload)
+result = response.json()
+print(result)
+
+
+
+DESTINATARIOS = [
+    'coordenadores@empresa.com',
+    'gerentes@empresa.com',
+    'financeiro_pagamentos@empresa.com',
+]
+REMETENTE = 'me'  # 'me' referencia o usuario autenticado nas credenciais
+
+
+def montar_tabela_html(resumo_lojas):
+    linhas_html = "".join(
+        f"<tr>"
+        f"<td>{row['loja_id']}</td>"
+        f"<td>{row['nome_loja']}</td>"
+        f"<td style='text-align:right'>{row['Freelas']}</td>"
+        f"<td style='text-align:right'>R$ {row['Valor_total']:,.2f}</td>"
+        f"</tr>"
+        for _, row in resumo_lojas.iterrows()
+    )
+    return f"""
+    <table border="1" cellpadding="6" cellspacing="0"
+           style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;">
+      <thead style="background-color:#f2f2f2;">
+        <tr><th>Store ID</th><th>Store Name</th><th>Freelas</th><th>Valor total</th></tr>
+      </thead>
+      <tbody>
+        {linhas_html}
+      </tbody>
+    </table>
+    """
+
+
+def montar_corpo_email(texto_resumo, resumo_lojas):
+    tabela_html = montar_tabela_html(resumo_lojas)
+    texto_html = (
+        texto_resumo
+        .replace('@canal ', '')
+        .replace(':alert:', '⚠️')
+        .split('```')[0]  # remove o bloco de tabela em texto puro, ja que teremos a tabela HTML
+        .replace('\n', '<br>')
+    )
+    return f"""
+    <html>
+      <body style="font-family:Arial,sans-serif;font-size:14px;">
+        <p>{texto_html}</p>
+        {tabela_html}
+      </body>
+    </html>
+    """
+
+
+def enviar_email_gmail(gmail_service, destinatarios, assunto, corpo_html):
+    mensagem = MIMEMultipart('alternative')
+    mensagem['To'] = ", ".join(destinatarios)
+    mensagem['Subject'] = assunto
+    mensagem.attach(MIMEText(corpo_html, 'html'))
+
+    corpo_codificado = base64.urlsafe_b64encode(mensagem.as_bytes()).decode()
+    resultado = gmail_service.users().messages().send(
+        userId=REMETENTE, body={'raw': corpo_codificado}
+    ).execute()
+    print(f"E-mail enviado com sucesso. ID: {resultado['id']}")
+    return resultado
+
+
+def enviar_resumo_pagamentos_email(creds, texto_resumo, resumo_lojas, periodo_texto):
+    gmail_service = build('gmail', 'v1', credentials=creds)
+    assunto = f"Resumo de Pagamentos - {periodo_texto}"
+    corpo_html = montar_corpo_email(texto_resumo, resumo_lojas)
+    return enviar_email_gmail(gmail_service, DESTINATARIOS, assunto, corpo_html)
+
+
+
+WHATSAPP_TOKEN = "[chave token]"                 
+PHONE_NUMBER_ID = "109876543210987"              
+API_VERSION = "v20.0"
+
+DESTINATARIOS_WHATSAPP = {
+    "Coordenador": "5573991234567",
+    "Gerente": "5573992345678",
+    "Financeiro_Terceiros_Pagamentos": "5573993456789",
+    "Lead_Area": "5573994567890",
+}
+
+BASE_URL = f"https://graph.facebook.com/{API_VERSION}/{PHONE_NUMBER_ID}"
+
+
+def _headers():
+    return {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+
+
+def enviar_documento_whatsapp(caminho_pdf, nome_arquivo, numero_destinatario, legenda=""):
+    with open(caminho_pdf, "rb") as arquivo:
+        resposta_upload = requests.post(
+            f"{BASE_URL}/media",
+            headers=_headers(),
+            files={"file": (nome_arquivo, arquivo, "application/pdf")},
+            data={"messaging_product": "whatsapp", "type": "application/pdf"},
+        )
+    resposta_upload.raise_for_status()
+    media_id = resposta_upload.json()["id"]
+    print(f"Documento enviado para a Meta, media_id: {media_id}")
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": numero_destinatario,
+        "type": "document",
+        "document": {
+            "id": media_id,
+            "filename": nome_arquivo,
+            "caption": legenda,
+        },
+    }
+    resposta_envio = requests.post(
+        f"{BASE_URL}/messages",
+        headers={**_headers(), "Content-Type": "application/json"},
+        json=payload,
+    )
+    resposta_envio.raise_for_status()
+    resultado = resposta_envio.json()
+    print(f"Mensagem enviada. ID: {resultado['messages'][0]['id']}")
+    return resultado
+
+
+def enviar_resumo_pagamentos_whatsapp(caminho_pdf, periodo_texto, numero_destinatario):
+    legenda = f"Resumo de Pagamentos - {periodo_texto}"
+    return enviar_documento_whatsapp(caminho_pdf, "resumo_pagamentos.pdf", numero_destinatario, legenda)
+
+
+def enviar_documento_para_varios(caminho_pdf, nome_arquivo, legenda, destinatarios):
+
+    with open(caminho_pdf, "rb") as arquivo:
+        resposta_upload = requests.post(
+            f"{BASE_URL}/media",
+            headers=_headers(),
+            files={"file": (nome_arquivo, arquivo, "application/pdf")},
+            data={"messaging_product": "whatsapp", "type": "application/pdf"},
+        )
+    resposta_upload.raise_for_status()
+    media_id = resposta_upload.json()["id"]
+    print(f"Documento enviado para a Meta, media_id: {media_id}")
+
+    resultados = []
+    for papel, numero in destinatarios.items():
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": numero,
+            "type": "document",
+            "document": {"id": media_id, "filename": nome_arquivo, "caption": legenda},
+        }
+        try:
+            resposta = requests.post(
+                f"{BASE_URL}/messages",
+                headers={**_headers(), "Content-Type": "application/json"},
+                json=payload,
+            )
+            resposta.raise_for_status()
+            print(f"  Enviado para {papel} ({numero})")
+            resultados.append({"papel": papel, "numero": numero, "status": "enviado"})
+        except requests.HTTPError as e:
+            print(f"  Falhou para {papel} ({numero}): {e}")
+            resultados.append({"papel": papel, "numero": numero, "status": "erro", "detalhe": str(e)})
+
+    return resultados
+
+
+
+
+
+
+
+
+
